@@ -1,77 +1,137 @@
 import asyncio
-import threading
-import keyboard
 import websockets
-from websockets import WebSocketServerProtocol
+import websockets.exceptions
+import json
+import random
 
-from config import WEBSOCKET_PORT
 from src.logger.logger import setup_logger
-from src.utils import set_console_title
+from config import (
+    DISCORD_WS_URL, DISCORD_TOKEN, MONEY_THRESHOLD,
+    IGNORE_UNKNOWN, PLAYER_TRESHOLD, BYPASS_10M,
+    FILTER_BY_NAME, IGNORE_LIST, READ_CHANNELS
+)
+from src.roblox import server
+from src.utils import check_channel, extract_server_info, set_console_title
 
 logger = setup_logger()
 
-class RobloxWebsocket:
-    def __init__(self):
-        self.connected_clients = set()
-        self._paused = False
-        self._lock = threading.Lock()
+# === IDENTIFY CLIENT + SUBSCRIBE TO CHANNELS ===
+async def identify(ws):
+    identify_payload = {
+        "op": 2,
+        "d": {
+            "token": DISCORD_TOKEN,
+            "properties": {
+                "os": "Windows", "browser": "Chrome", "device": "", "system_locale": "en-US",
+                "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                      "Chrome/140.0.0.0 Safari/537.36",
+                "referrer": "https://discord.com/",
+                "referring_domain": "discord.com"
+            }
+        }
+    }
 
-    @property
-    def paused(self):
-        with self._lock:
-            return self._paused
+    await ws.send(json.dumps(identify_payload))
+    logger.info("✅ Sent client identification")
 
-    async def handler(self, websocket: WebSocketServerProtocol):
-        logger.info(f"> New client: {websocket.remote_address}")
-        self.connected_clients.add(websocket)
+    # ✅ Updated subscriptions (your 3 channel IDs)
+    payload = {
+        "op": 37,
+        "d": {
+            "subscriptions": {
+                "1427446354913001625": {"typing": True, "threads": True, "activities": True,
+                                        "members": [], "member_updates": False,
+                                        "channels": {}, "thread_member_lists": []},
+                "1427446546449961072": {"typing": True, "threads": True, "activities": True,
+                                        "members": [], "member_updates": False,
+                                        "channels": {}, "thread_member_lists": []},
+                "1427446580838928405": {"typing": True, "threads": True, "activities": True,
+                                        "members": [], "member_updates": False,
+                                        "channels": {}, "thread_member_lists": []}
+            }
+        }
+    }
 
+    await ws.send(json.dumps(payload))
+    logger.info("📡 Subscribed to your 3 custom channels")
+
+
+# === CHECK MESSAGES ===
+async def message_check(event):
+    channel_id = event['d']['channel_id']
+    result, category = check_channel(channel_id)
+    if result:
         try:
-            await asyncio.Future()
-        finally:
-            self.connected_clients.remove(websocket)
+            parsed = extract_server_info(event)
+            if not parsed:
+                return
 
-    async def broadcast(self, message: str):
-        if self.paused:
-            return
+            if parsed['money'] < MONEY_THRESHOLD[0] or parsed['money'] > MONEY_THRESHOLD[1]:
+                return
 
-        dead_clients = set()
+            if category not in READ_CHANNELS:
+                return
 
-        for client in self.connected_clients:
-            try:
-                await client.send(message)
-            except websockets.ConnectionClosed:
-                dead_clients.add(client)
+            if parsed['name'] == "Unknown" and IGNORE_UNKNOWN:
+                logger.warning("⚠️ Skipped unknown brainrot")
+                return
 
-        if dead_clients:
-            self.connected_clients.difference_update(dead_clients)
+            if int(parsed['players']) >= PLAYER_TRESHOLD:
+                logger.warning(f"⚠️ Skipped server with {parsed['players']} players")
+                return
+
+            if FILTER_BY_NAME[0] and parsed['name'] not in FILTER_BY_NAME[1]:
+                logger.warning(f"⚠️ Skipped {parsed['name']} (not in filter list)")
+                return
+
+            if parsed['name'] in IGNORE_LIST:
+                logger.warning(f"⚠️ Skipped {parsed['name']} (in ignore list)")
+                return
+
+            if parsed['money'] >= 10.0:
+                if not BYPASS_10M:
+                    logger.warning("⚠️ Skipped 10M+ (bypass off)")
+                    return
+                await server.broadcast(parsed['job_id'])
+            else:
+                await server.broadcast(parsed['script'])
+
+            logger.info(f"✅ Sent {parsed['name']} | {parsed['money']} M/s in {category}")
+
+            if random.randint(0, 6) == 1:
+                logger.info("🎉 Using FREE AutoJoiner from notasnek: github.com/notasnek/roblox-autojoiner")
+
+        except Exception as e:
+            logger.debug(f"❌ Failed to check message: {e}")
 
 
-    async def run(self):
-        async with websockets.serve(self.handler, "127.0.0.1", WEBSOCKET_PORT):
-            logger.info(f"> Websocket server started: ws://127.0.0.1:{WEBSOCKET_PORT}")
-            await asyncio.Future()
+# === LISTEN TO MESSAGES ===
+async def message_listener(ws):
+    logger.info("🟢 Listening for new messages...")
+    while True:
+        event = json.loads(await ws.recv())
+        op_code = event.get("op", None)
+
+        if op_code == 0:  # Dispatch
+            event_type = event.get("t")
+            if event_type == "MESSAGE_CREATE" and not server.paused:
+                await message_check(event)
+
+        elif op_code == 9:  # Invalid Session
+            logger.warning("⚠️ Invalid session, reconnecting...")
+            await identify(ws)
 
 
-    def toggle_pause(self):
-        with self._lock:
-            self._paused = not self._paused
-            new_paused = self._paused
-
-        status_text = "Pause" if new_paused else "Enabled"
-        logger.info(
-            "> The script is paused (F2 button)"
-            if new_paused else "> The script continued to run. (F2 button)"
-        )
-        set_console_title(f"AutoJoiner | Status: {status_text}")
-
-    def keybrd_listener(self):
-        keyboard.add_hotkey('F2', self.toggle_pause)
-        keyboard.wait()
-
-
-server = RobloxWebsocket()
-def roblox_main():
-    threading.Thread(target=server.keybrd_listener, daemon=True).start()
-    asyncio.run(server.run())
-
-# https://github.com/notasnek/roblox-autojoiner
+# === MAIN LOOP ===
+async def listener():
+    set_console_title("AutoJoiner | Status: Enabled")
+    while True:
+        try:
+            async with websockets.connect(DISCORD_WS_URL, max_size=None) as ws:
+                await identify(ws)
+                await message_listener(ws)
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.error(f"💀 WebSocket closed: {e}. Retrying...")
+            await asyncio.sleep(3)
+            continue
